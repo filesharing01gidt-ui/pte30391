@@ -5,8 +5,6 @@ import logging
 import os
 import re
 import sqlite3
-
-from dotenv import load_dotenv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,7 +19,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
 DATABASE_PATH = Path("channel_balances.sqlite3")
