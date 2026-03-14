@@ -318,6 +318,7 @@ def admin_result_embed(
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
     if not topic_synced:
+        embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
         embed.add_field(
             name="Topic Sync",
             value="Stored balance updated, topic sync failed",
@@ -343,6 +344,7 @@ def transport_result_embed(
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
     if not topic_synced:
+        embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
         embed.add_field(
             name="Topic Sync",
             value="Stored balance updated, topic sync failed",
@@ -382,9 +384,10 @@ def is_safe_integer(value: int) -> bool:
     return -MAX_INT64 <= value <= MAX_INT64
 
 
-def queue_topic_sync(channel: discord.TextChannel, new_balance: int) -> str:
-    """Queue a best-effort topic sync and return human-readable status."""
-    return topic_sync.enqueue(channel, new_balance)
+def queue_topic_sync(channel: discord.TextChannel, new_balance: int) -> tuple[bool, str]:
+    """Queue a best-effort topic sync and return status in unified result shape."""
+    status = topic_sync.enqueue(channel, new_balance)
+    return False, status
 
 
 async def get_or_initialize_balance(channel: discord.TextChannel) -> Optional[int]:
@@ -435,8 +438,8 @@ async def update_balance_and_topic(
         if not saved:
             return None
 
-        topic_status = queue_topic_sync(channel, new_balance)
-        return BalanceUpdateResult(previous_balance, new_balance, topic_status)
+        topic_synced, topic_message = queue_topic_sync(channel, new_balance)
+        return BalanceUpdateResult(previous_balance, new_balance, topic_synced, topic_message)
 
 
 async def set_balance_and_topic(channel: discord.TextChannel, new_balance: int) -> Optional[BalanceUpdateResult]:
@@ -454,8 +457,8 @@ async def set_balance_and_topic(channel: discord.TextChannel, new_balance: int) 
         if not saved:
             return None
 
-        topic_status = queue_topic_sync(channel, new_balance)
-        return BalanceUpdateResult(previous_balance, new_balance, topic_status)
+        topic_synced, topic_message = queue_topic_sync(channel, new_balance)
+        return BalanceUpdateResult(previous_balance, new_balance, topic_synced, topic_message)
 
 
 def user_is_admin(interaction: discord.Interaction) -> bool:
@@ -657,7 +660,7 @@ async def add_balance(
             )
             return
 
-        topic_status = queue_topic_sync(text_channel, new_balance)
+        topic_synced, topic_message = queue_topic_sync(text_channel, new_balance)
 
     logger.info("/add updated channel %s to %s", text_channel.id, new_balance)
 
@@ -667,7 +670,8 @@ async def add_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_status=topic_status,
+        topic_synced=topic_synced,
+        topic_message=topic_message,
     )
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
 
@@ -715,7 +719,8 @@ async def set_balance_command(
         previous_balance=result.previous_balance,
         new_balance=result.new_balance,
         channel=text_channel,
-        topic_status=result.topic_status,
+        topic_synced=result.topic_synced,
+        topic_message=result.topic_message,
     )
     logger.info("/set updated channel %s to %s", text_channel.id, result.new_balance)
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
@@ -773,7 +778,7 @@ async def remove_balance(
             )
             return
 
-        topic_status = queue_topic_sync(text_channel, new_balance)
+        topic_synced, topic_message = queue_topic_sync(text_channel, new_balance)
 
     logger.info("/remove updated channel %s to %s", text_channel.id, new_balance)
 
@@ -783,7 +788,8 @@ async def remove_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_status=topic_status,
+        topic_synced=topic_synced,
+        topic_message=topic_message,
     )
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
 
@@ -906,14 +912,21 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    try:
-        if await handle_transport_command(message):
-            return
+    is_transport_command = message.content.strip() in TRANSPORT_COSTS
 
+    if is_transport_command:
+        try:
+            await handle_transport_command(message)
+        except Exception:
+            logger.exception("Error while processing transport command")
+        return
+
+    try:
         if await handle_answer_command(message):
             return
     except Exception:
-        logger.exception("Error while processing message command")
+        logger.exception("Error while processing answer command")
+        return
 
     await bot.process_commands(message)
 
