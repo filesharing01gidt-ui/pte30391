@@ -41,6 +41,8 @@ ERROR_COLOR = 0xDC2626
 ADMIN_COLOR = 0x0F766E
 AUDIT_COLOR = 0x7C3AED
 ANSWER_COLOR = 0x1D4ED8
+TOPIC_SYNC_DEBOUNCE_SECONDS = 1.5
+TOPIC_SYNC_COOLDOWN_SECONDS = 300.0
 
 TRANSPORT_COSTS: dict[str, tuple[str, int]] = {
     "?taxi": ("Taxi", 50),
@@ -169,6 +171,116 @@ storage = BalanceStorage(DATABASE_PATH)
 _tree_synced = False
 
 
+class TopicSyncCoordinator:
+    """Best-effort, coalesced topic synchronization with cooldown handling."""
+
+    def __init__(self) -> None:
+        self._pending_balance: dict[int, int] = {}
+        self._channel_refs: dict[int, discord.TextChannel] = {}
+        self._tasks: dict[int, asyncio.Task[None]] = {}
+        self._cooldown_until: dict[int, float] = {}
+
+    def _get_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
+        cached = bot.get_channel(channel_id)
+        if isinstance(cached, discord.TextChannel):
+            self._channel_refs[channel_id] = cached
+            return cached
+
+        fallback = self._channel_refs.get(channel_id)
+        if isinstance(fallback, discord.TextChannel):
+            return fallback
+
+        return None
+
+    def enqueue(self, channel: discord.TextChannel, balance: int) -> str:
+        """Queue a coalesced topic sync request; never blocks caller."""
+        channel_id = channel.id
+        self._channel_refs[channel_id] = channel
+        self._pending_balance[channel_id] = balance
+
+        now = time.monotonic()
+        cooldown_until = self._cooldown_until.get(channel_id, 0.0)
+        if cooldown_until > now:
+            wait_s = int(cooldown_until - now)
+            logger.info("Topic sync queued for channel %s but cooldown is active for %ss", channel_id, wait_s)
+            status = "Queued for topic sync after cooldown."
+        else:
+            status = "Queued for topic sync."
+
+        task = self._tasks.get(channel_id)
+        if task and not task.done():
+            logger.info("Coalesced topic sync update for channel %s to latest balance %s", channel_id, balance)
+            return status
+
+        task = asyncio.create_task(self._worker(channel_id))
+        self._tasks[channel_id] = task
+        task.add_done_callback(lambda t, cid=channel_id: self._on_task_done(cid, t))
+        logger.info("Started topic sync worker for channel %s", channel_id)
+        return status
+
+    def _on_task_done(self, channel_id: int, task: asyncio.Task[None]) -> None:
+        self._tasks.pop(channel_id, None)
+        try:
+            task.result()
+        except Exception:
+            logger.exception("Topic sync worker crashed for channel %s", channel_id)
+
+    async def _worker(self, channel_id: int) -> None:
+        while channel_id in self._pending_balance:
+            await asyncio.sleep(TOPIC_SYNC_DEBOUNCE_SECONDS)
+            desired_balance = self._pending_balance.get(channel_id)
+            if desired_balance is None:
+                break
+
+            now = time.monotonic()
+            cooldown_until = self._cooldown_until.get(channel_id, 0.0)
+            if cooldown_until > now:
+                wait_s = cooldown_until - now
+                logger.info("Skipping topic sync for channel %s due to cooldown (%0.1fs remaining)", channel_id, wait_s)
+                await asyncio.sleep(min(wait_s, 30.0))
+                continue
+
+            channel = self._get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                logger.warning("Cannot sync topic for channel %s because channel is unavailable", channel_id)
+                self._pending_balance.pop(channel_id, None)
+                return
+
+            desired_topic = build_synced_topic(channel.topic, desired_balance)
+            if (channel.topic or "") == desired_topic:
+                logger.info("Skipped topic sync no-op for channel %s; topic already current", channel_id)
+                if self._pending_balance.get(channel_id) == desired_balance:
+                    self._pending_balance.pop(channel_id, None)
+                continue
+
+            try:
+                await channel.edit(topic=desired_topic, reason="Balance synchronization")
+                logger.info("Topic sync succeeded for channel %s", channel_id)
+                if self._pending_balance.get(channel_id) == desired_balance:
+                    self._pending_balance.pop(channel_id, None)
+            except discord.Forbidden:
+                logger.warning("Missing permission to edit topic for channel %s; dropping pending sync", channel_id)
+                self._pending_balance.pop(channel_id, None)
+                return
+            except discord.HTTPException as exc:
+                retry_after = float(getattr(exc, "retry_after", 0.0) or 0.0)
+                cooldown = max(TOPIC_SYNC_COOLDOWN_SECONDS, retry_after)
+                self._cooldown_until[channel_id] = time.monotonic() + cooldown
+                logger.warning(
+                    "Topic sync failed for channel %s with HTTP %s. Cooldown set to %.1fs",
+                    channel_id,
+                    getattr(exc, "status", "unknown"),
+                    cooldown,
+                )
+            except Exception:
+                logger.exception("Unexpected error syncing topic for channel %s", channel_id)
+                self._pending_balance.pop(channel_id, None)
+                return
+
+
+topic_sync = TopicSyncCoordinator()
+
+
 def base_embed(title: str, description: str, color: int) -> discord.Embed:
     """Create a standardized embed."""
     return discord.Embed(title=title, description=description, color=color)
@@ -270,21 +382,9 @@ def is_safe_integer(value: int) -> bool:
     return -MAX_INT64 <= value <= MAX_INT64
 
 
-async def sync_channel_topic(channel: discord.TextChannel, new_balance: int) -> tuple[bool, str]:
-    """Attempt to sync channel topic to the given balance."""
-    try:
-        new_topic = build_synced_topic(channel.topic, new_balance)
-        await channel.edit(topic=new_topic, reason="Balance synchronization")
-        return True, "Topic synchronized successfully."
-    except discord.Forbidden:
-        logger.warning("Missing permission to edit topic for channel %s", channel.id)
-        return False, "Stored balance updated but topic sync failed due to missing permissions."
-    except discord.HTTPException as exc:
-        logger.warning("HTTP error while syncing topic for channel %s: %s", channel.id, exc)
-        return False, "Stored balance updated but topic sync failed due to an API error."
-    except Exception:
-        logger.exception("Unexpected error while syncing topic for channel %s", channel.id)
-        return False, "Stored balance updated but topic sync failed due to an unexpected error."
+def queue_topic_sync(channel: discord.TextChannel, new_balance: int) -> str:
+    """Queue a best-effort topic sync and return human-readable status."""
+    return topic_sync.enqueue(channel, new_balance)
 
 
 async def get_or_initialize_balance(channel: discord.TextChannel) -> Optional[int]:
@@ -335,8 +435,8 @@ async def update_balance_and_topic(
         if not saved:
             return None
 
-        topic_synced, topic_message = await sync_channel_topic(channel, new_balance)
-        return BalanceUpdateResult(previous_balance, new_balance, topic_synced, topic_message)
+        topic_status = queue_topic_sync(channel, new_balance)
+        return BalanceUpdateResult(previous_balance, new_balance, topic_status)
 
 
 async def set_balance_and_topic(channel: discord.TextChannel, new_balance: int) -> Optional[BalanceUpdateResult]:
@@ -354,8 +454,8 @@ async def set_balance_and_topic(channel: discord.TextChannel, new_balance: int) 
         if not saved:
             return None
 
-        topic_synced, topic_message = await sync_channel_topic(channel, new_balance)
-        return BalanceUpdateResult(previous_balance, new_balance, topic_synced, topic_message)
+        topic_status = queue_topic_sync(channel, new_balance)
+        return BalanceUpdateResult(previous_balance, new_balance, topic_status)
 
 
 def user_is_admin(interaction: discord.Interaction) -> bool:
@@ -532,6 +632,7 @@ async def add_balance(
         return
 
     text_channel = channel
+    await interaction.response.defer(ephemeral=False)
     lock = storage.get_channel_lock(text_channel.id)
     async with lock:
         previous = await get_or_initialize_balance(text_channel)
@@ -556,7 +657,7 @@ async def add_balance(
             )
             return
 
-        topic_synced, topic_message = await sync_channel_topic(text_channel, new_balance)
+        topic_status = queue_topic_sync(text_channel, new_balance)
 
     logger.info("/add updated channel %s to %s", text_channel.id, new_balance)
 
@@ -566,8 +667,7 @@ async def add_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_synced=topic_synced,
-        topic_message=topic_message,
+        topic_status=topic_status,
     )
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
 
@@ -599,6 +699,7 @@ async def set_balance_command(
         return
 
     text_channel = channel
+    await interaction.response.defer(ephemeral=False)
     result = await set_balance_and_topic(text_channel, amount)
     if result is None:
         await send_interaction_embed(
@@ -614,8 +715,7 @@ async def set_balance_command(
         previous_balance=result.previous_balance,
         new_balance=result.new_balance,
         channel=text_channel,
-        topic_synced=result.topic_synced,
-        topic_message=result.topic_message,
+        topic_status=result.topic_status,
     )
     logger.info("/set updated channel %s to %s", text_channel.id, result.new_balance)
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
@@ -648,6 +748,7 @@ async def remove_balance(
         return
 
     text_channel = channel
+    await interaction.response.defer(ephemeral=False)
     lock = storage.get_channel_lock(text_channel.id)
     async with lock:
         previous = await get_or_initialize_balance(text_channel)
@@ -672,7 +773,7 @@ async def remove_balance(
             )
             return
 
-        topic_synced, topic_message = await sync_channel_topic(text_channel, new_balance)
+        topic_status = queue_topic_sync(text_channel, new_balance)
 
     logger.info("/remove updated channel %s to %s", text_channel.id, new_balance)
 
@@ -682,8 +783,7 @@ async def remove_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_synced=topic_synced,
-        topic_message=topic_message,
+        topic_status=topic_status,
     )
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
 
@@ -691,6 +791,7 @@ async def remove_balance(
 @bot.tree.command(name="balances", description="Audit all tracked channel balances.")
 @app_commands.check(user_is_admin)
 async def balances_audit(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
     rows = await storage.list_all_balances()
     logger.info("/balances requested. Returning %d rows", len(rows))
     if not rows:
