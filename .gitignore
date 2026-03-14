@@ -1,0 +1,4 @@
+.env
+channel_balances.sqlite3
+__pycache__/
+*.pyc
