@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+from typing import Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -20,6 +20,8 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
 BOT_PREFIX = "!"
 ANSWER_PREFIX = "?answer-"
+ADMIN_PREFIXES = ("?add", "?set", "?remove")
+
 CORRECT_ANSWER = "CBAIJHGEFD"
 ANSWER_LENGTH = len(CORRECT_ANSWER)
 ALLOWED_CHARS = set(CORRECT_ANSWER)
@@ -39,6 +41,7 @@ TRANSPORT_COSTS: dict[str, tuple[str, int]] = {
 }
 
 MONEY_PATTERN = re.compile(r"^\$(\d+)")
+CHANNEL_MENTION_PATTERN = re.compile(r"^<#(\d+)>$")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -97,7 +100,7 @@ def admin_result_embed(
     return embed
 
 
-def parse_topic_balance(topic: str | None) -> int | None:
+def parse_topic_balance(topic: Optional[str]) -> Optional[int]:
     if not topic:
         return None
     match = MONEY_PATTERN.match(topic)
@@ -109,52 +112,9 @@ def parse_topic_balance(topic: str | None) -> int | None:
         return None
 
 
-def replace_topic_balance(topic: str | None, new_balance: int) -> str:
+def replace_topic_balance(topic: Optional[str], new_balance: int) -> str:
     original = topic or ""
     return MONEY_PATTERN.sub(f"${new_balance}", original, count=1)
-
-
-def user_is_admin(interaction: discord.Interaction) -> bool:
-    return (
-        interaction.guild is not None
-        and isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
-    )
-
-
-def validate_amount(amount: int) -> str | None:
-    if amount < 0:
-        return "Amount must be a non-negative integer."
-    return None
-
-
-async def send_interaction_embed(
-    interaction: discord.Interaction,
-    *,
-    embed: discord.Embed,
-    ephemeral: bool,
-) -> None:
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=ephemeral)
-    except discord.HTTPException:
-        logger.exception("Failed to send interaction response")
-
-
-async def apply_topic_balance_update(
-    channel: discord.TextChannel,
-    transform: callable,
-) -> tuple[int, int] | None:
-    old_amount = parse_topic_balance(channel.topic)
-    if old_amount is None:
-        return None
-
-    new_amount = int(transform(old_amount))
-    new_topic = replace_topic_balance(channel.topic, new_amount)
-    await channel.edit(topic=new_topic, reason="Balance update")
-    return old_amount, new_amount
 
 
 async def handle_transport_command(message: discord.Message) -> bool:
@@ -168,34 +128,151 @@ async def handle_transport_command(message: discord.Message) -> bool:
     label, cost = TRANSPORT_COSTS[content]
     channel = message.channel
 
+    old_amount = parse_topic_balance(channel.topic)
+    if old_amount is None:
+        return True
+
+    new_amount = old_amount - cost
+
     try:
-        result = await apply_topic_balance_update(channel, lambda amount: amount - cost)
+        new_topic = replace_topic_balance(channel.topic, new_amount)
+        await channel.edit(topic=new_topic, reason="Transport balance update")
     except discord.Forbidden:
         logger.warning("Missing permission to edit topic for channel %s", channel.id)
         return True
     except discord.HTTPException:
-        logger.warning("HTTP error updating topic for channel %s", channel.id)
+        logger.warning("HTTP error editing topic for channel %s", channel.id)
         return True
     except Exception:
         logger.exception("Unexpected transport update error for channel %s", channel.id)
         return True
 
-    if result is None:
-        return True
-
-    previous_balance, new_balance = result
     embed = transport_result_embed(
         label=label,
         cost=cost,
-        previous_balance=previous_balance,
-        new_balance=new_balance,
+        previous_balance=old_amount,
+        new_balance=new_amount,
     )
-
     try:
         await message.reply(embed=embed, mention_author=False)
     except discord.HTTPException:
         logger.exception("Failed to send transport reply")
 
+    return True
+
+
+async def handle_admin_prefix_command(message: discord.Message) -> bool:
+    content = message.content.strip()
+    parts = content.split()
+    if not parts:
+        return False
+
+    command = parts[0].lower()
+    if command not in ADMIN_PREFIXES:
+        return False
+
+    if message.guild is None or not isinstance(message.channel, discord.TextChannel):
+        return True
+
+    if not isinstance(message.author, discord.Member) or not message.author.guild_permissions.administrator:
+        await message.reply(embed=permission_error_embed(), mention_author=False)
+        return True
+
+    if len(parts) < 2:
+        await message.reply(
+            embed=base_embed("Validation Error", "Usage: ?add/?set/?remove <amount> [#channel]", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        await message.reply(
+            embed=base_embed("Validation Error", "Amount must be a non-negative integer.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+
+    if amount < 0:
+        await message.reply(
+            embed=base_embed("Validation Error", "Amount must be a non-negative integer.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+
+    target_channel: discord.TextChannel = message.channel
+    if len(parts) >= 3:
+        mention_match = CHANNEL_MENTION_PATTERN.match(parts[2])
+        if not mention_match:
+            await message.reply(
+                embed=base_embed("Validation Error", "Target channel must be a valid text channel mention.", ERROR_COLOR),
+                mention_author=False,
+            )
+            return True
+
+        resolved = bot.get_channel(int(mention_match.group(1)))
+        if not isinstance(resolved, discord.TextChannel):
+            await message.reply(
+                embed=base_embed("Validation Error", "Target channel must be a text channel.", ERROR_COLOR),
+                mention_author=False,
+            )
+            return True
+        target_channel = resolved
+
+    old_amount = parse_topic_balance(target_channel.topic)
+    if old_amount is None:
+        await message.reply(
+            embed=base_embed("Validation Error", "Channel topic must start with $<number>.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+
+    if command == "?add":
+        new_amount = old_amount + amount
+        action = "Add"
+    elif command == "?remove":
+        new_amount = old_amount - amount
+        action = "Remove"
+    else:
+        new_amount = amount
+        action = "Set"
+
+    try:
+        new_topic = replace_topic_balance(target_channel.topic, new_amount)
+        await target_channel.edit(topic=new_topic, reason=f"Balance update via {command}")
+    except discord.Forbidden:
+        logger.warning("Missing permission to edit topic for channel %s", target_channel.id)
+        await message.reply(
+            embed=base_embed("Permission Error", "Bot cannot edit this channel topic.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+    except discord.HTTPException:
+        logger.warning("HTTP error editing topic for channel %s", target_channel.id)
+        await message.reply(
+            embed=base_embed("Request Error", "Could not update the channel topic.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+    except Exception:
+        logger.exception("Unexpected admin update error for channel %s", target_channel.id)
+        await message.reply(
+            embed=base_embed("Command Error", "Unexpected error while updating balance.", ERROR_COLOR),
+            mention_author=False,
+        )
+        return True
+
+    await message.reply(
+        embed=admin_result_embed(
+            action=action,
+            amount=amount,
+            previous_balance=old_amount,
+            new_balance=new_amount,
+            channel=target_channel,
+        ),
+        mention_author=False,
+    )
     return True
 
 
@@ -248,7 +325,7 @@ async def handle_answer_command(message: discord.Message) -> bool:
         await message.reply(embed=invalid_guess_embed("All letters must be unique."), mention_author=False)
         return True
 
-    score = sum(1 for g, c in zip(guess, CORRECT_ANSWER) if g == c)
+    score = sum(1 for guessed_char, correct_char in zip(guess, CORRECT_ANSWER) if guessed_char == correct_char)
     await message.reply(
         embed=base_embed("Guess Score", f"{score}/{ANSWER_LENGTH}", ANSWER_COLOR),
         mention_author=False,
@@ -256,134 +333,9 @@ async def handle_answer_command(message: discord.Message) -> bool:
     return True
 
 
-async def handle_admin_balance_command(
-    interaction: discord.Interaction,
-    *,
-    action: str,
-    amount: int,
-    channel: discord.TextChannel,
-    transform: callable,
-) -> None:
-    amount_error = validate_amount(amount)
-    if amount_error:
-        await send_interaction_embed(
-            interaction,
-            embed=base_embed("Validation Error", amount_error, ERROR_COLOR),
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    old_amount = parse_topic_balance(channel.topic)
-    if old_amount is None:
-        await send_interaction_embed(
-            interaction,
-            embed=base_embed("Validation Error", "Channel topic must start with $<number>.", ERROR_COLOR),
-            ephemeral=True,
-        )
-        return
-
-    try:
-        new_amount = int(transform(old_amount))
-        new_topic = replace_topic_balance(channel.topic, new_amount)
-        await channel.edit(topic=new_topic, reason=f"Balance update via /{action.lower()}")
-    except discord.Forbidden:
-        logger.warning("Missing permission to edit topic for channel %s", channel.id)
-        await send_interaction_embed(
-            interaction,
-            embed=base_embed("Permission Error", "Bot cannot edit this channel topic.", ERROR_COLOR),
-            ephemeral=True,
-        )
-        return
-    except discord.HTTPException:
-        logger.warning("HTTP error editing topic for channel %s", channel.id)
-        await send_interaction_embed(
-            interaction,
-            embed=base_embed("Request Error", "Could not update the channel topic.", ERROR_COLOR),
-            ephemeral=True,
-        )
-        return
-    except Exception:
-        logger.exception("Unexpected admin balance update error for channel %s", channel.id)
-        await send_interaction_embed(
-            interaction,
-            embed=base_embed("Command Error", "Unexpected error while updating balance.", ERROR_COLOR),
-            ephemeral=True,
-        )
-        return
-
-    embed = admin_result_embed(
-        action=action,
-        amount=amount,
-        previous_balance=old_amount,
-        new_balance=new_amount,
-        channel=channel,
-    )
-    await send_interaction_embed(interaction, embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="add", description="Add an amount to a channel topic balance.")
-@app_commands.check(user_is_admin)
-@app_commands.describe(amount="Non-negative amount to add", channel="Target text channel")
-async def add_balance(interaction: discord.Interaction, amount: int, channel: discord.TextChannel) -> None:
-    await handle_admin_balance_command(
-        interaction,
-        action="Add",
-        amount=amount,
-        channel=channel,
-        transform=lambda old: old + amount,
-    )
-
-
-@bot.tree.command(name="set", description="Set a channel topic balance.")
-@app_commands.check(user_is_admin)
-@app_commands.describe(amount="Non-negative amount to set", channel="Target text channel")
-async def set_balance(interaction: discord.Interaction, amount: int, channel: discord.TextChannel) -> None:
-    await handle_admin_balance_command(
-        interaction,
-        action="Set",
-        amount=amount,
-        channel=channel,
-        transform=lambda _old: amount,
-    )
-
-
-@bot.tree.command(name="remove", description="Remove an amount from a channel topic balance.")
-@app_commands.check(user_is_admin)
-@app_commands.describe(amount="Non-negative amount to remove", channel="Target text channel")
-async def remove_balance(interaction: discord.Interaction, amount: int, channel: discord.TextChannel) -> None:
-    await handle_admin_balance_command(
-        interaction,
-        action="Remove",
-        amount=amount,
-        channel=channel,
-        transform=lambda old: old - amount,
-    )
-
-
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
-    if isinstance(error, app_commands.CheckFailure):
-        await send_interaction_embed(interaction, embed=permission_error_embed(), ephemeral=True)
-        return
-
-    logger.exception("Unhandled app command error: %s", error)
-    await send_interaction_embed(
-        interaction,
-        embed=base_embed("Command Error", "An internal error occurred.", ERROR_COLOR),
-        ephemeral=True,
-    )
-
-
 @bot.event
 async def on_ready() -> None:
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "unknown")
-    try:
-        synced = await bot.tree.sync()
-        logger.info("Synced %d app commands", len(synced))
-    except discord.HTTPException:
-        logger.exception("Failed to sync app command tree")
 
 
 @bot.event
@@ -396,6 +348,13 @@ async def on_message(message: discord.Message) -> None:
             await handle_transport_command(message)
         except Exception:
             logger.exception("Error while processing transport command")
+        return
+
+    if message.content.strip().startswith(ADMIN_PREFIXES):
+        try:
+            await handle_admin_prefix_command(message)
+        except Exception:
+            logger.exception("Error while processing admin prefix command")
         return
 
     try:
