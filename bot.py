@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
-DATABASE_PATH = Path("channel_balances.sqlite3")
+DATABASE_PATH = Path(__file__).resolve().parent / "channel_balances.sqlite3"
 BOT_PREFIX = "!"
 ANSWER_PREFIX = "?answer-"
 CORRECT_ANSWER = "CBAIJHGEFD"
@@ -97,7 +97,7 @@ class BalanceStorage:
                 )
                 conn.commit()
                 conn.close()
-                logger.info("Storage initialized at %s", self.db_path)
+                logger.info("Storage initialized at %s", self.db_path.resolve())
             except sqlite3.Error:
                 logger.exception("Failed to initialize storage")
                 raise
@@ -118,7 +118,9 @@ class BalanceStorage:
                     (channel_id,),
                 ).fetchone()
                 conn.close()
-                return int(row[0]) if row else None
+                balance = int(row[0]) if row else None
+                logger.debug("Fetched stored balance for channel %s: %s", channel_id, balance)
+                return balance
             except (sqlite3.Error, TypeError, ValueError):
                 logger.exception("Failed to fetch balance for channel %s", channel_id)
                 return None
@@ -139,6 +141,7 @@ class BalanceStorage:
                 )
                 conn.commit()
                 conn.close()
+                logger.info("Persisted balance for channel %s: %s", channel_id, balance)
                 return True
             except sqlite3.Error:
                 logger.exception("Failed to persist balance for channel %s", channel_id)
@@ -153,7 +156,9 @@ class BalanceStorage:
                     "SELECT channel_id, balance FROM channel_balances"
                 ).fetchall()
                 conn.close()
-                return [(int(channel_id), int(balance)) for channel_id, balance in rows]
+                parsed_rows = [(int(channel_id), int(balance)) for channel_id, balance in rows]
+                logger.info("Loaded %d balance rows from storage", len(parsed_rows))
+                return parsed_rows
             except (sqlite3.Error, TypeError, ValueError):
                 logger.exception("Failed to list all balances")
                 return []
@@ -405,7 +410,19 @@ async def handle_transport_command(message: discord.Message) -> bool:
     )
 
     if result is None:
+        logger.info(
+            "Transport command ignored for channel %s because no stored/initializable balance was found",
+            channel.id,
+        )
         return True
+
+    logger.info(
+        "Transport command applied on channel %s: %s, %s -> %s",
+        channel.id,
+        label,
+        result.previous_balance,
+        result.new_balance,
+    )
 
     embed = transport_result_embed(
         label=label,
@@ -540,6 +557,8 @@ async def add_balance(
 
         topic_synced, topic_message = await sync_channel_topic(text_channel, new_balance)
 
+    logger.info("/add updated channel %s to %s", text_channel.id, new_balance)
+
     embed = admin_result_embed(
         action="Add",
         amount=amount,
@@ -597,6 +616,7 @@ async def set_balance_command(
         topic_synced=result.topic_synced,
         topic_message=result.topic_message,
     )
+    logger.info("/set updated channel %s to %s", text_channel.id, result.new_balance)
     await send_interaction_embed(interaction, embed=embed, ephemeral=False)
 
 
@@ -653,6 +673,8 @@ async def remove_balance(
 
         topic_synced, topic_message = await sync_channel_topic(text_channel, new_balance)
 
+    logger.info("/remove updated channel %s to %s", text_channel.id, new_balance)
+
     embed = admin_result_embed(
         action="Remove",
         amount=amount,
@@ -669,6 +691,7 @@ async def remove_balance(
 @app_commands.check(user_is_admin)
 async def balances_audit(interaction: discord.Interaction) -> None:
     rows = await storage.list_all_balances()
+    logger.info("/balances requested. Returning %d rows", len(rows))
     if not rows:
         await send_interaction_embed(
             interaction,
