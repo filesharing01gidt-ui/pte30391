@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,7 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +21,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Load local environment variables from .env before reading the bot token.
+load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
 DATABASE_PATH = Path("channel_balances.sqlite3")
