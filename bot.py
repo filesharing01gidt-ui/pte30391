@@ -305,8 +305,6 @@ def admin_result_embed(
     previous_balance: int,
     new_balance: int,
     channel: discord.TextChannel,
-    topic_synced: bool,
-    topic_message: str,
 ) -> discord.Embed:
     embed = base_embed(
         "Balance Updated",
@@ -317,14 +315,6 @@ def admin_result_embed(
     embed.add_field(name="Previous Balance", value=f"${previous_balance}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
-    if not topic_synced:
-        embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
-        embed.add_field(
-            name="Topic Sync",
-            value="Stored balance updated, topic sync failed",
-            inline=False,
-        )
-        embed.set_footer(text=topic_message)
     return embed
 
 
@@ -334,23 +324,12 @@ def transport_result_embed(
     cost: int,
     previous_balance: int,
     new_balance: int,
-    channel: discord.TextChannel,
-    topic_synced: bool,
-    topic_message: str,
 ) -> discord.Embed:
-    embed = base_embed("Transport Recorded", f"Transport: {label}", TRANSPORT_COLOR)
+    embed = base_embed("Transport Recorded", "", TRANSPORT_COLOR)
     embed.add_field(name="Amount Deducted", value=f"${cost}", inline=True)
     embed.add_field(name="Previous Balance", value=f"${previous_balance}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
-    embed.add_field(name="Target Channel", value=channel.mention, inline=False)
-    if not topic_synced:
-        embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
-        embed.add_field(
-            name="Topic Sync",
-            value="Stored balance updated, topic sync failed",
-            inline=False,
-        )
-        embed.set_footer(text=topic_message)
+    embed.add_field(name="Transport", value=label, inline=False)
     return embed
 
 
@@ -533,9 +512,6 @@ async def handle_transport_command(message: discord.Message) -> bool:
         cost=cost,
         previous_balance=result.previous_balance,
         new_balance=result.new_balance,
-        channel=channel,
-        topic_synced=result.topic_synced,
-        topic_message=result.topic_message,
     )
     try:
         await message.reply(embed=embed, mention_author=False)
@@ -635,7 +611,7 @@ async def add_balance(
         return
 
     text_channel = channel
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
     lock = storage.get_channel_lock(text_channel.id)
     async with lock:
         previous = await get_or_initialize_balance(text_channel)
@@ -660,7 +636,7 @@ async def add_balance(
             )
             return
 
-        topic_synced, topic_message = queue_topic_sync(text_channel, new_balance)
+        queue_topic_sync(text_channel, new_balance)
 
     logger.info("/add updated channel %s to %s", text_channel.id, new_balance)
 
@@ -670,10 +646,8 @@ async def add_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_synced=topic_synced,
-        topic_message=topic_message,
     )
-    await send_interaction_embed(interaction, embed=embed, ephemeral=False)
+    await send_interaction_embed(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="set", description="Set a channel balance.")
@@ -703,7 +677,7 @@ async def set_balance_command(
         return
 
     text_channel = channel
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
     result = await set_balance_and_topic(text_channel, amount)
     if result is None:
         await send_interaction_embed(
@@ -719,11 +693,9 @@ async def set_balance_command(
         previous_balance=result.previous_balance,
         new_balance=result.new_balance,
         channel=text_channel,
-        topic_synced=result.topic_synced,
-        topic_message=result.topic_message,
     )
     logger.info("/set updated channel %s to %s", text_channel.id, result.new_balance)
-    await send_interaction_embed(interaction, embed=embed, ephemeral=False)
+    await send_interaction_embed(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="remove", description="Remove an amount from a channel balance.")
@@ -753,7 +725,7 @@ async def remove_balance(
         return
 
     text_channel = channel
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
     lock = storage.get_channel_lock(text_channel.id)
     async with lock:
         previous = await get_or_initialize_balance(text_channel)
@@ -778,7 +750,7 @@ async def remove_balance(
             )
             return
 
-        topic_synced, topic_message = queue_topic_sync(text_channel, new_balance)
+        queue_topic_sync(text_channel, new_balance)
 
     logger.info("/remove updated channel %s to %s", text_channel.id, new_balance)
 
@@ -788,10 +760,8 @@ async def remove_balance(
         previous_balance=previous,
         new_balance=new_balance,
         channel=text_channel,
-        topic_synced=topic_synced,
-        topic_message=topic_message,
     )
-    await send_interaction_embed(interaction, embed=embed, ephemeral=False)
+    await send_interaction_embed(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="balances", description="Audit all tracked channel balances.")
@@ -860,6 +830,89 @@ async def balances_audit(interaction: discord.Interaction) -> None:
                 await interaction.followup.send(embed=embed, ephemeral=True)
     except discord.HTTPException:
         logger.exception("Failed to send balances audit response")
+
+
+def simple_topic_sync_embed(title: str, channel: discord.TextChannel, balance: Optional[int] = None) -> discord.Embed:
+    embed = base_embed(title, "", ADMIN_COLOR if "Failed" not in title else ERROR_COLOR)
+    embed.add_field(name="Channel", value=channel.mention, inline=False)
+    if balance is not None:
+        embed.add_field(name="Balance", value=f"${balance}", inline=False)
+    return embed
+
+
+async def try_single_topic_sync(channel: discord.TextChannel, balance: int) -> tuple[str, bool]:
+    """Attempt exactly one immediate topic sync, respecting cooldown for safety."""
+    now = time.monotonic()
+    cooldown_until = topic_sync._cooldown_until.get(channel.id, 0.0)
+    if cooldown_until > now:
+        logger.info("Manual topic sync skipped for channel %s due to active cooldown", channel.id)
+        return "cooldown", False
+
+    desired_topic = build_synced_topic(channel.topic, balance)
+    if (channel.topic or "") == desired_topic:
+        logger.info("Manual topic sync no-op for channel %s; already synchronized", channel.id)
+        return "already", True
+
+    try:
+        await asyncio.wait_for(
+            channel.edit(topic=desired_topic, reason="Manual topic resync"),
+            timeout=2.0,
+        )
+        logger.info("Manual topic sync succeeded for channel %s", channel.id)
+        return "success", True
+    except asyncio.TimeoutError:
+        topic_sync._cooldown_until[channel.id] = time.monotonic() + TOPIC_SYNC_COOLDOWN_SECONDS
+        logger.warning("Manual topic sync timed out for channel %s", channel.id)
+        return "failed", False
+    except discord.Forbidden:
+        logger.warning("Manual topic sync forbidden for channel %s", channel.id)
+        return "failed", False
+    except discord.HTTPException as exc:
+        retry_after = float(getattr(exc, "retry_after", 0.0) or 0.0)
+        cooldown = max(TOPIC_SYNC_COOLDOWN_SECONDS, retry_after)
+        topic_sync._cooldown_until[channel.id] = time.monotonic() + cooldown
+        logger.warning("Manual topic sync HTTP failure for channel %s, status=%s", channel.id, getattr(exc, "status", "unknown"))
+        return "failed", False
+    except Exception:
+        logger.exception("Manual topic sync unexpected failure for channel %s", channel.id)
+        return "failed", False
+
+
+@bot.tree.command(name="resynctopic", description="Manually resync one channel topic from stored balance.")
+@app_commands.check(user_is_admin)
+@app_commands.describe(channel="Target text channel")
+async def resync_topic(interaction: discord.Interaction, channel: discord.abc.GuildChannel) -> None:
+    channel_error = validate_text_channel(channel)
+    if channel_error:
+        await send_interaction_embed(
+            interaction,
+            embed=base_embed("Validation Error", channel_error, ERROR_COLOR),
+            ephemeral=True,
+        )
+        return
+
+    text_channel = channel
+    await interaction.response.defer(ephemeral=True)
+
+    stored_balance = await storage.get_balance(text_channel.id)
+    if stored_balance is None:
+        await send_interaction_embed(
+            interaction,
+            embed=simple_topic_sync_embed("No Stored Balance", text_channel),
+            ephemeral=True,
+        )
+        return
+
+    status, _ok = await try_single_topic_sync(text_channel, stored_balance)
+    if status == "already":
+        embed = simple_topic_sync_embed("Topic Already Synced", text_channel, stored_balance)
+    elif status == "success":
+        embed = simple_topic_sync_embed("Topic Resynced", text_channel, stored_balance)
+    else:
+        embed = simple_topic_sync_embed("Topic Sync Failed", text_channel, stored_balance)
+
+    await send_interaction_embed(interaction, embed=embed, ephemeral=True)
+
 
 
 @bot.tree.error
