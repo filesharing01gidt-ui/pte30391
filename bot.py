@@ -71,7 +71,8 @@ def validate_token() -> None:
 class BalanceUpdateResult:
     previous_balance: int
     new_balance: int
-    topic_status: str
+    topic_synced: bool
+    topic_message: str
 
 
 class BalanceStorage:
@@ -304,7 +305,8 @@ def admin_result_embed(
     previous_balance: int,
     new_balance: int,
     channel: discord.TextChannel,
-    topic_status: Optional[str],
+    topic_synced: bool,
+    topic_message: str,
 ) -> discord.Embed:
     embed = base_embed(
         "Balance Updated",
@@ -315,8 +317,13 @@ def admin_result_embed(
     embed.add_field(name="Previous Balance", value=f"${previous_balance}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
-    if topic_status:
-        embed.add_field(name="Topic Sync", value=topic_status, inline=False)
+    if not topic_synced:
+        embed.add_field(
+            name="Topic Sync",
+            value="Stored balance updated, topic sync failed",
+            inline=False,
+        )
+        embed.set_footer(text=topic_message)
     return embed
 
 
@@ -327,15 +334,21 @@ def transport_result_embed(
     previous_balance: int,
     new_balance: int,
     channel: discord.TextChannel,
-    topic_status: Optional[str],
+    topic_synced: bool,
+    topic_message: str,
 ) -> discord.Embed:
     embed = base_embed("Transport Recorded", f"Transport: {label}", TRANSPORT_COLOR)
     embed.add_field(name="Amount Deducted", value=f"${cost}", inline=True)
     embed.add_field(name="Previous Balance", value=f"${previous_balance}", inline=True)
     embed.add_field(name="New Balance", value=f"${new_balance}", inline=True)
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
-    if topic_status:
-        embed.add_field(name="Topic Sync", value=topic_status, inline=False)
+    if not topic_synced:
+        embed.add_field(
+            name="Topic Sync",
+            value="Stored balance updated, topic sync failed",
+            inline=False,
+        )
+        embed.set_footer(text=topic_message)
     return embed
 
 
@@ -518,7 +531,8 @@ async def handle_transport_command(message: discord.Message) -> bool:
         previous_balance=result.previous_balance,
         new_balance=result.new_balance,
         channel=channel,
-        topic_status=result.topic_status,
+        topic_synced=result.topic_synced,
+        topic_message=result.topic_message,
     )
     try:
         await message.reply(embed=embed, mention_author=False)
