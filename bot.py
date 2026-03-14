@@ -319,6 +319,11 @@ def admin_result_embed(
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
     if not topic_synced:
         embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
+        embed.add_field(
+            name="Topic Sync",
+            value="Stored balance updated, topic sync failed",
+            inline=False,
+        )
         embed.set_footer(text=topic_message)
     return embed
 
@@ -340,6 +345,11 @@ def transport_result_embed(
     embed.add_field(name="Target Channel", value=channel.mention, inline=False)
     if not topic_synced:
         embed.add_field(name="Topic Sync", value="Stored balance updated, topic sync pending", inline=False)
+        embed.add_field(
+            name="Topic Sync",
+            value="Stored balance updated, topic sync failed",
+            inline=False,
+        )
         embed.set_footer(text=topic_message)
     return embed
 
